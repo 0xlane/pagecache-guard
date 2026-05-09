@@ -8,16 +8,16 @@ It intercepts `execve()` calls for SUID/SGID binaries using `fanotify`, then com
 
 ## Why This Exists
 
-Page cache corruption vulnerabilities allow attackers to modify the in-memory content of **read-only** files without touching the on-disk data:
+Page cache corruption vulnerabilities allow attackers to modify the in-memory content of **read-only** files:
 
-| CVE | Name | Year |
-|-----|------|------|
-| CVE-2026-43284 / CVE-2026-43500 | Dirty Frag | 2026 |
-| CVE-2026-31431 | Copy Fail | 2026 |
-| CVE-2022-0847 | Dirty Pipe | 2022 |
-| CVE-2016-5195 | Dirty COW | 2016 |
+| CVE | Name | Year | O_DIRECT Detectable |
+|-----|------|------|:-------------------:|
+| CVE-2026-43284 / CVE-2026-43500 | Dirty Frag | 2026 | ✅ |
+| CVE-2026-31431 | Copy Fail | 2026 | ✅ |
+| CVE-2022-0847 | Dirty Pipe | 2022 | ✅ |
+| CVE-2016-5195 | Dirty COW | 2016 | ❌ |
 
-Traditional security tools (file integrity monitors, image scanners, fs-verity) read through the page cache and **cannot detect** these attacks — they see the tampered data as "normal". `O_DIRECT` bypasses the page cache entirely, reading directly from disk, making it the only reliable way to detect such tampering.
+Traditional security tools (file integrity monitors, image scanners, fs-verity) read through the page cache and **cannot detect** these attacks — they see the tampered data as "normal". `O_DIRECT` bypasses the page cache entirely, reading directly from disk, making it the only reliable way to detect page-cache-only tampering (Copy Fail, Dirty Pipe, Dirty Frag). Dirty COW is the exception — it writes corrupted data back to disk via page writeback, so `O_DIRECT` reads the same tampered content. Dirty COW requires traditional file integrity checks (AIDE / `rpm -V` / Tripwire) for detection.
 
 ## How It Works
 
