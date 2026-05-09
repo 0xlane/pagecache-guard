@@ -2,9 +2,14 @@
 
 **[中文文档](README.zh-CN.md)**
 
-A runtime integrity guard that detects and blocks Linux page cache tampering attacks at execution time.
+A runtime integrity guard that detects and blocks Linux page cache tampering attacks.
 
-It intercepts `execve()` calls for SUID/SGID binaries using `fanotify`, then compares the file's page cache content against the on-disk content via `O_DIRECT`. If they differ, execution is denied — preventing privilege escalation through tampered SUID binaries.
+It uses `fanotify` + `O_DIRECT` to compare page cache content against on-disk content, covering multiple attack surfaces:
+
+- **SUID/SGID binaries** — intercepts `execve()`, blocks tampered binaries
+- **Daemon-executed files** — process-tree analysis detects files run by `crond`, `systemd`, `atd`
+- **Critical config files** — inode-level monitoring of `/etc/passwd`, `/etc/profile`, PAM modules, `ld.so.preload`
+- **Shared libraries** — periodic scanning for already-mapped libs
 
 ## Why This Exists
 
@@ -22,37 +27,50 @@ Traditional security tools (file integrity monitors, image scanners, fs-verity) 
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    pagecache_guard                       │
-│                                                         │
-│  1. Scan directories for SUID/SGID binaries             │
-│  2. Register fanotify FAN_OPEN_EXEC_PERM monitor        │
-│  3. On execve() of a SUID/SGID binary:                  │
-│     a. Check executor UID (skip root — already privd)   │
-│     b. Read file via page cache (normal read)            │
-│     c. Read file via O_DIRECT (bypass page cache)        │
-│     d. Compare: match → ALLOW, mismatch → DENY          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  pagecache_guard (v0.2)                       │
+│                                                              │
+│  FAN_OPEN_EXEC_PERM (mount mark) ──────────────────────────  │
+│  On execve():                                                │
+│    1. SUID/SGID binary?  → O_DIRECT check (block/allow)     │
+│    2. Parent is crond/systemd/atd?  → O_DIRECT check         │
+│    3. Neither?  → FAN_ALLOW (zero overhead)                  │
+│                                                              │
+│  FAN_OPEN_PERM (inode marks) ──────────────────────────────  │
+│  On open() of marked files:                                  │
+│    /etc/passwd, /etc/profile, PAM modules, ld.so.preload     │
+│    → O_DIRECT check (block/allow)                            │
+│                                                              │
+│  Periodic O_DIRECT scan (background thread) ───────────────  │
+│  Already-mapped shared libraries (libnss, libpam, etc.)      │
+│  → Alert only (cannot block, already mmap'd)                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ```mermaid
 flowchart TD
-    A[Start Guard] --> B[Scan for SUID/SGID files]
-    B --> C[Register fanotify\nexecution monitor]
-    C --> D{Binary\nexecve'd}
+    A[Start Guard] --> B[Scan SUID/SGID files]
+    B --> C[Set up fanotify\nmount marks + inode marks]
+    C --> D{Event received}
 
-    D --> E{In SUID/SGID\nlist?}
-    E -- No --> F[FAN_ALLOW\nPass through]
-    E -- Yes --> G{Executor\nUID = 0?}
+    D --> E{SUID/SGID\nbinary?}
+    E -- Yes --> G{UID = 0?}
+    E -- No --> F{Parent is\nwatched daemon?}
 
-    G -- Yes --> H[Skip check\nFAN_ALLOW]
-    G -- No --> I[O_DIRECT disk read\nvs page cache read]
+    F -- Yes --> I
+    F -- No --> P{Inode-marked\nfile?}
 
-    I --> J{Content\nmatch?}
+    P -- Yes --> I
+    P -- No --> Q[FAN_ALLOW\nSkip]
+
+    G -- Yes --> H[Skip check]
+    G -- No --> I[O_DIRECT vs\nPage Cache]
+
+    I --> J{Match?}
     J -- Yes --> K[FAN_ALLOW]
     J -- No --> L[FAN_DENY\nBlock + Alert]
 
-    F --> D
+    Q --> D
     H --> D
     K --> D
     L --> D
@@ -61,43 +79,55 @@ flowchart TD
 ## Quick Start
 
 ```bash
-# Basic — monitor /usr, /bin, /sbin
-sudo python3 pagecache_guard.py
-
-# Specify paths
+# SUID-only mode (backward compatible, same as v0.1)
 sudo python3 pagecache_guard.py /usr /bin /sbin
 
+# Full protection — SUID + daemon-exec + critical files + periodic scan
+sudo python3 -m pagecache_guard \
+    --watch-daemon crond,anacron,atd,systemd \
+    --watch-file /etc/passwd /etc/profile /etc/ld.so.preload \
+    --watch-pam /lib64/security \
+    --watch-lib /lib64/libnss_files.so.2 /lib64/libpam.so.0 \
+    /usr /bin /sbin
+
+# Add daemon-exec detection only (simplest extension)
+sudo python3 -m pagecache_guard --watch-daemon crond,systemd /usr
+
 # Dry-run mode (alert only, don't block)
-sudo python3 pagecache_guard.py --dry-run /usr
+sudo python3 -m pagecache_guard --dry-run /usr
 
 # Periodic re-scan for new SUID files (every 5 minutes)
-sudo python3 pagecache_guard.py --rescan-interval 300 /usr
+sudo python3 -m pagecache_guard --rescan-interval 300 /usr
 
-# Log to syslog
-sudo python3 pagecache_guard.py --syslog /usr
-
-# Log to file
-sudo python3 pagecache_guard.py --log-file /var/log/pagecache_guard.log /usr
+# Log to syslog + file
+sudo python3 -m pagecache_guard --syslog --log-file /var/log/pagecache_guard.log /usr
 
 # Also check root executions
-sudo python3 pagecache_guard.py --check-root /usr
+sudo python3 -m pagecache_guard --check-root /usr
 ```
 
 ## Example Output
 
 ```
-2026-05-08 06:57:31 INFO Scanning for SUID/SGID files in: /usr
-2026-05-08 06:57:34 INFO Found 21 SUID/SGID files
-2026-05-08 06:57:34 INFO   SUID/SGID: /usr/bin/su
-2026-05-08 06:57:34 INFO   SUID/SGID: /usr/bin/sudo
-2026-05-08 06:57:34 INFO   SUID/SGID: /usr/bin/passwd
-...
-2026-05-08 06:57:34 INFO Monitoring mount (FAN_OPEN_EXEC_PERM): /usr
-2026-05-08 06:57:34 INFO Guard active [ENFORCE] (event_size=24, check_root=False)
+2026-05-09 14:20:01 INFO Scanning for SUID/SGID files in: /usr
+2026-05-09 14:20:03 INFO Found 21 SUID/SGID files
+2026-05-09 14:20:03 INFO Watching daemon parents: anacron, atd, crond, systemd
+2026-05-09 14:20:03 INFO Auto-discovered 12 PAM modules in /lib64/security
+2026-05-09 14:20:03 INFO Inode marks set for 15 files
+2026-05-09 14:20:03 INFO Periodic scanner started: 2 libs, interval=5s
+2026-05-09 14:20:03 INFO Guard active [ENFORCE] features=[SUID, daemon-exec, inode-watch(15), periodic-scan(2)] check_root=False
 
-# Tampered /usr/bin/su detected and blocked:
-2026-05-08 06:57:38 WARNING [ALERT] BLOCKED pid=2677362 uid=1000 /usr/bin/su
+# Tampered SUID binary blocked:
+2026-05-09 14:20:38 WARNING [ALERT] BLOCKED pid=2677362 uid=1000 /usr/bin/su reason=suid
                             (page cache tampered at offset 0)
+
+# Tampered cron script blocked:
+2026-05-09 14:21:00 WARNING [ALERT] BLOCKED pid=2677500 uid=0 /usr/local/bin/backup.sh reason=daemon:crond
+                            (page cache tampered at offset 128)
+
+# Tampered PAM module blocked:
+2026-05-09 14:21:05 WARNING [ALERT] BLOCKED pid=2677510 uid=0 /lib64/security/pam_unix.so reason=inode_watch
+                            (page cache tampered at offset 4096)
 ```
 
 On the user's side:
@@ -105,6 +135,29 @@ On the user's side:
 ```bash
 $ /usr/bin/su
 bash: /usr/bin/su: Operation not permitted  (exit 126)
+```
+
+## Code Structure
+
+```
+pagecache-guard/
+├── pagecache_guard/              # Python package (v0.2)
+│   ├── __init__.py
+│   ├── __main__.py               # CLI entry point (argparse + orchestration)
+│   ├── config.py                 # Constants and libc handle
+│   ├── core.py                   # O_DIRECT read, integrity check, checksum cache
+│   ├── fanotify_handler.py       # fanotify setup, mount marks, event loop
+│   ├── process_tree.py           # /proc traversal for daemon-child detection
+│   ├── inode_watcher.py          # FAN_OPEN_PERM inode marks for critical files
+│   └── periodic_scanner.py       # Background thread for mapped-lib scanning
+├── pagecache_guard.py            # Backward-compatible single-file entry point
+├── poc/                          # Exploitation PoCs
+│   ├── host-attacks/             # 7 host-side attack path PoCs
+│   ├── poc_marker.py
+│   ├── verify_marker.py
+│   └── shocker_copyfail.py
+├── README.md
+└── README.zh-CN.md
 ```
 
 ## Requirements
@@ -119,20 +172,21 @@ bash: /usr/bin/su: Operation not permitted  (exit 126)
 
 ## Detection Scope
 
-The fanotify Guard intercepts `execve()` via `FAN_OPEN_EXEC_PERM` — by design it only covers SUID/SGID binary execution. Here's how it maps to actual host-side attack paths (see `poc/host-attacks/` for PoCs):
+v0.2 extends coverage from SUID-only to **7 of 7** host-side attack paths (see `poc/host-attacks/` for PoCs):
 
-| Attack Path | fanotify Guard | O_DIRECT Periodic Scan | Why |
-|-------------|:--------------:|:----------------------:|-----|
-| SUID/SGID binary overwrite | ✅ | ✅ | Real-time interception at execve |
-| `/etc/passwd` UID tampering | ❌ | ✅ | Config file, read via `open()`+`read()` |
-| PAM module bypass | ❌ | ✅ | Shared library loaded via `dlopen()` |
-| Shared library live-patching | ❌ | ✅ | Loaded via `mmap()`, not execve |
-| `/etc/profile` command injection | ❌ | ✅ | Shell `source`, not execve |
-| Cron script tampering | ❌ | ✅ | Executed by crond, but not a SUID file |
-| `ld.so.preload` path hijacking | ❌ | ✅ | Read by dynamic linker at process startup |
-| Container escape (layer sharing) | ❌ | ✅ | Periodic scan of overlay lower layer |
+| # | Attack Path | Mechanism | Timing | Can Block? |
+|---|-------------|-----------|--------|:----------:|
+| 1 | SUID/SGID binary overwrite | `FAN_OPEN_EXEC_PERM` + SUID check | At execve | ✅ |
+| 2 | `/etc/passwd` UID tampering | `FAN_OPEN_PERM` inode mark | At open by NSS | ✅ |
+| 3 | PAM module bypass | `FAN_OPEN_PERM` inode mark | At dlopen during auth | ✅ |
+| 4 | Shared lib (new load) | `FAN_OPEN_PERM` inode mark | At open by dlopen | ✅ |
+| 4' | Shared lib (already mapped) | Periodic O_DIRECT scan | Polled (5s default) | ❌ alert only |
+| 5 | `/etc/profile` command injection | `FAN_OPEN_PERM` inode mark | At source by shell | ✅ |
+| 6 | Cron/systemd exec'd file | `FAN_OPEN_EXEC_PERM` + parent=daemon | At execve | ✅ |
+| 7 | `ld.so.preload` hijacking | `FAN_OPEN_PERM` inode mark | At open by ld.so | ✅ |
+| — | Container escape (layer sharing) | Periodic O_DIRECT scan | Polled | ❌ alert only |
 
-The Guard covers the most urgent case — blocking tampered SUID binary execution. For the remaining 6 host-side paths and container scenarios, use periodic `O_DIRECT` scanning of critical files. Scan priority: PAM modules & shared libraries (`/lib64/security/`, `/lib64/*.so`) > config files (`/etc/passwd`, `/etc/profile`, `/etc/ld.so.preload`) > cron scripts & container lower layers.
+**6 of 7 paths** offer real-time blocking; only already-mapped shared libraries are alert-only (polled).
 
 ## PoC Scripts
 

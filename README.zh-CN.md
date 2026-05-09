@@ -2,9 +2,14 @@
 
 **[English](README.md)**
 
-一个运行时完整性守护工具，在执行时检测并拦截 Linux 页缓存篡改攻击。
+一个运行时完整性守护工具，检测并拦截 Linux 页缓存篡改攻击。
 
-通过 `fanotify` 拦截 SUID/SGID 二进制文件的 `execve()` 调用，使用 `O_DIRECT` 比对页缓存内容与磁盘内容。若不一致则拒绝执行，阻止通过篡改 SUID 文件实现的提权攻击。
+通过 `fanotify` + `O_DIRECT` 比对页缓存内容与磁盘内容，覆盖多种攻击面：
+
+- **SUID/SGID 二进制** — 拦截 `execve()`，阻断被篡改的二进制执行
+- **守护进程执行的文件** — 进程树分析，检测 `crond`、`systemd`、`atd` 执行的文件
+- **关键配置文件** — inode 级监控 `/etc/passwd`、`/etc/profile`、PAM 模块、`ld.so.preload`
+- **共享库** — 周期性扫描已映射的共享库
 
 ## 背景
 
@@ -21,24 +26,51 @@
 
 ## 工作原理
 
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  pagecache_guard (v0.2)                       │
+│                                                              │
+│  FAN_OPEN_EXEC_PERM（挂载点标记）────────────────────────── │
+│  execve 事件:                                                │
+│    1. SUID/SGID 二进制?  → O_DIRECT 检查（拦截/放行）       │
+│    2. 父进程是 crond/systemd/atd?  → O_DIRECT 检查          │
+│    3. 都不是?  → FAN_ALLOW（零开销）                        │
+│                                                              │
+│  FAN_OPEN_PERM（inode 标记）─────────────────────────────── │
+│  标记文件被 open() 时:                                       │
+│    /etc/passwd, /etc/profile, PAM 模块, ld.so.preload        │
+│    → O_DIRECT 检查（拦截/放行）                              │
+│                                                              │
+│  周期性 O_DIRECT 扫描（后台线程）────────────────────────── │
+│  已映射的共享库（libnss、libpam 等）                         │
+│  → 仅告警（无法拦截，已被 mmap）                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
 ```mermaid
 flowchart TD
-    A[启动 Guard] --> B[扫描目录下所有\nSUID/SGID 文件]
-    B --> C[注册 fanotify\n执行权限监控]
-    C --> D{二进制被\nexecve}
+    A[启动 Guard] --> B[扫描 SUID/SGID 文件]
+    B --> C[设置 fanotify\n挂载点标记 + inode 标记]
+    C --> D{收到事件}
 
-    D --> E{在 SUID/SGID\n列表中?}
-    E -- 否 --> F[FAN_ALLOW\n直接放行]
-    E -- 是 --> G{执行者\nUID = 0?}
+    D --> E{SUID/SGID\n二进制?}
+    E -- 是 --> G{UID = 0?}
+    E -- 否 --> F{父进程是\n监控的守护进程?}
 
-    G -- 是 --> H[跳过检查\nFAN_ALLOW\nroot 无需提权]
-    G -- 否 --> I[O_DIRECT 读磁盘\nvs\nread 读页缓存]
+    F -- 是 --> I
+    F -- 否 --> P{被 inode\n标记的文件?}
 
-    I --> J{内容\n一致?}
-    J -- 是 --> K[FAN_ALLOW\n放行执行]
-    J -- 否 --> L[FAN_DENY\n拦截执行\n输出告警]
+    P -- 是 --> I
+    P -- 否 --> Q[FAN_ALLOW\n跳过]
 
-    F --> D
+    G -- 是 --> H[跳过检查]
+    G -- 否 --> I[O_DIRECT 磁盘读取\nvs 页缓存读取]
+
+    I --> J{内容一致?}
+    J -- 是 --> K[FAN_ALLOW]
+    J -- 否 --> L[FAN_DENY\n拦截 + 告警]
+
+    Q --> D
     H --> D
     K --> D
     L --> D
@@ -47,41 +79,55 @@ flowchart TD
 ## 快速开始
 
 ```bash
-# 基本用法 — 监控 /usr /bin /sbin 下的 SUID/SGID 文件
-sudo python3 pagecache_guard.py
-
-# 指定监控路径
+# 仅 SUID 模式（向后兼容 v0.1）
 sudo python3 pagecache_guard.py /usr /bin /sbin
 
+# 全功能模式 — SUID + 守护进程执行 + 关键文件 + 周期扫描
+sudo python3 -m pagecache_guard \
+    --watch-daemon crond,anacron,atd,systemd \
+    --watch-file /etc/passwd /etc/profile /etc/ld.so.preload \
+    --watch-pam /lib64/security \
+    --watch-lib /lib64/libnss_files.so.2 /lib64/libpam.so.0 \
+    /usr /bin /sbin
+
+# 仅添加守护进程执行检测（最简扩展）
+sudo python3 -m pagecache_guard --watch-daemon crond,systemd /usr
+
 # Dry-run 模式（只告警不拦截）
-sudo python3 pagecache_guard.py --dry-run /usr
+sudo python3 -m pagecache_guard --dry-run /usr
 
 # 定期重新扫描 SUID 文件（每 300 秒）
-sudo python3 pagecache_guard.py --rescan-interval 300 /usr
+sudo python3 -m pagecache_guard --rescan-interval 300 /usr
 
-# 输出到 syslog
-sudo python3 pagecache_guard.py --syslog /usr
-
-# 输出到日志文件
-sudo python3 pagecache_guard.py --log-file /var/log/pagecache_guard.log /usr
+# 输出到 syslog + 日志文件
+sudo python3 -m pagecache_guard --syslog --log-file /var/log/pagecache_guard.log /usr
 
 # 连 root 执行也检查
-sudo python3 pagecache_guard.py --check-root /usr
+sudo python3 -m pagecache_guard --check-root /usr
 ```
 
 ## 运行效果
 
 ```
-2026-05-08 06:57:31 INFO Scanning for SUID/SGID files in: /usr
-2026-05-08 06:57:34 INFO Found 21 SUID/SGID files
-2026-05-08 06:57:34 INFO   SUID/SGID: /usr/bin/su
-2026-05-08 06:57:34 INFO   SUID/SGID: /usr/bin/sudo
-...
-2026-05-08 06:57:34 INFO Guard active [ENFORCE] (event_size=24, check_root=False)
+2026-05-09 14:20:01 INFO Scanning for SUID/SGID files in: /usr
+2026-05-09 14:20:03 INFO Found 21 SUID/SGID files
+2026-05-09 14:20:03 INFO Watching daemon parents: anacron, atd, crond, systemd
+2026-05-09 14:20:03 INFO Auto-discovered 12 PAM modules in /lib64/security
+2026-05-09 14:20:03 INFO Inode marks set for 15 files
+2026-05-09 14:20:03 INFO Periodic scanner started: 2 libs, interval=5s
+2026-05-09 14:20:03 INFO Guard active [ENFORCE] features=[SUID, daemon-exec, inode-watch(15), periodic-scan(2)] check_root=False
 
-# 被篡改的 /usr/bin/su 被检测并拦截:
-2026-05-08 06:57:38 WARNING [ALERT] BLOCKED pid=2677362 uid=1000 /usr/bin/su
+# 被篡改的 SUID 二进制被拦截:
+2026-05-09 14:20:38 WARNING [ALERT] BLOCKED pid=2677362 uid=1000 /usr/bin/su reason=suid
                             (page cache tampered at offset 0)
+
+# 被篡改的 cron 脚本被拦截:
+2026-05-09 14:21:00 WARNING [ALERT] BLOCKED pid=2677500 uid=0 /usr/local/bin/backup.sh reason=daemon:crond
+                            (page cache tampered at offset 128)
+
+# 被篡改的 PAM 模块被拦截:
+2026-05-09 14:21:05 WARNING [ALERT] BLOCKED pid=2677510 uid=0 /lib64/security/pam_unix.so reason=inode_watch
+                            (page cache tampered at offset 4096)
 ```
 
 用户侧：
@@ -89,6 +135,29 @@ sudo python3 pagecache_guard.py --check-root /usr
 ```bash
 $ /usr/bin/su
 bash: /usr/bin/su: 不允许的操作  (exit 126)
+```
+
+## 代码结构
+
+```
+pagecache-guard/
+├── pagecache_guard/              # Python 包（v0.2）
+│   ├── __init__.py
+│   ├── __main__.py               # CLI 入口（argparse + 流程编排）
+│   ├── config.py                 # 常量和 libc 句柄
+│   ├── core.py                   # O_DIRECT 读取、完整性校验、校验和缓存
+│   ├── fanotify_handler.py       # fanotify 设置、挂载点标记、事件循环
+│   ├── process_tree.py           # /proc 进程树遍历（守护进程子进程检测）
+│   ├── inode_watcher.py          # FAN_OPEN_PERM inode 标记管理
+│   └── periodic_scanner.py       # 后台线程周期扫描已映射共享库
+├── pagecache_guard.py            # 向后兼容的单文件入口
+├── poc/                          # 漏洞利用 PoC
+│   ├── host-attacks/             # 7 条宿主机攻击路径 PoC
+│   ├── poc_marker.py
+│   ├── verify_marker.py
+│   └── shocker_copyfail.py
+├── README.md
+└── README.zh-CN.md
 ```
 
 ## 系统要求
@@ -103,20 +172,21 @@ bash: /usr/bin/su: 不允许的操作  (exit 126)
 
 ## 检测覆盖范围
 
-fanotify Guard 基于 `FAN_OPEN_EXEC_PERM` 拦截 `execve()`，设计上仅覆盖 SUID/SGID 二进制执行。以下是与实际宿主机攻击路径的对照（PoC 见 `poc/host-attacks/`）：
+v0.2 将覆盖范围从仅 SUID 扩展至 **7/7** 条宿主机攻击路径（PoC 见 `poc/host-attacks/`）：
 
-| 攻击路径 | fanotify Guard | O_DIRECT 定期扫描 | 原因 |
-|---------|:--------------:|:----------------:|------|
-| SUID/SGID 二进制覆写 | ✅ | ✅ | execve 时实时拦截 |
-| `/etc/passwd` UID 篡改 | ❌ | ✅ | 配置文件，被 `open()`+`read()` 读取 |
-| PAM 模块认证绕过 | ❌ | ✅ | 共享库通过 `dlopen()` 加载 |
-| 共享库 Live-Patching | ❌ | ✅ | 通过 `mmap()` 映射，非 execve |
-| `/etc/profile` 命令注入 | ❌ | ✅ | 登录 Shell `source` 读取 |
-| Cron 脚本篡改 | ❌ | ✅ | 由 crond 通过 `execve()` 执行，但不属于 SUID 文件 |
-| `ld.so.preload` 路径劫持 | ❌ | ✅ | 动态链接器在进程启动时读取 |
-| 容器逃逸（层共享） | ❌ | ✅ | overlay lower layer 定期扫描 |
+| # | 攻击路径 | 检测机制 | 时机 | 可拦截? |
+|---|---------|---------|------|:------:|
+| 1 | SUID/SGID 二进制覆写 | `FAN_OPEN_EXEC_PERM` + SUID 检查 | execve 时 | ✅ |
+| 2 | `/etc/passwd` UID 篡改 | `FAN_OPEN_PERM` inode 标记 | NSS open 时 | ✅ |
+| 3 | PAM 模块认证绕过 | `FAN_OPEN_PERM` inode 标记 | 认证时 dlopen | ✅ |
+| 4 | 共享库（新加载） | `FAN_OPEN_PERM` inode 标记 | dlopen open 时 | ✅ |
+| 4' | 共享库（已映射） | 周期性 O_DIRECT 扫描 | 轮询（默认 5s） | ❌ 仅告警 |
+| 5 | `/etc/profile` 命令注入 | `FAN_OPEN_PERM` inode 标记 | Shell source 时 | ✅ |
+| 6 | Cron/systemd 执行的文件 | `FAN_OPEN_EXEC_PERM` + 父进程=守护进程 | execve 时 | ✅ |
+| 7 | `ld.so.preload` 路径劫持 | `FAN_OPEN_PERM` inode 标记 | ld.so open 时 | ✅ |
+| — | 容器逃逸（层共享） | 周期性 O_DIRECT 扫描 | 轮询 | ❌ 仅告警 |
 
-Guard 解决最危急的场景——阻止被篡改的 SUID 二进制执行提权。其余 6 条宿主机路径和容器场景，通过 O_DIRECT 定期扫描覆盖。扫描优先级：PAM 模块和共享库（`/lib64/security/`、`/lib64/*.so`）> 关键配置文件（`/etc/passwd`、`/etc/profile`、`/etc/ld.so.preload`）> cron 脚本和容器 lower layer。
+**7 条路径中 6 条支持实时拦截**；仅已映射的共享库为告警模式（轮询）。
 
 ## PoC 脚本
 
