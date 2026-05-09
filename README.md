@@ -226,6 +226,7 @@ If a SUID binary is being updated (e.g., `yum update`), the page cache and disk 
 ## Related Research
 
 - [Copy Fail — xint.io](https://xint.io/posts/copy-fail-cve-2026-31431/) — Original vulnerability disclosure and technical writeup
+- [Copy Fail — reinject.top](https://reinject.top/en/posts/linux-security/copy-fail-cve-2026-31431/) — In-depth research article
 - [CVE-2026-31431 on NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-31431)
 - [Kernel fix commit](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=a664bf3d603d)
 
