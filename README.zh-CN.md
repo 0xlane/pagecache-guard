@@ -12,6 +12,7 @@
 
 | CVE | 名称 | 年份 |
 |-----|------|------|
+| CVE-2026-43284 / CVE-2026-43500 | Dirty Frag | 2026 |
 | CVE-2026-31431 | Copy Fail | 2026 |
 | CVE-2022-0847 | Dirty Pipe | 2022 |
 | CVE-2016-5195 | Dirty COW | 2016 |
@@ -102,13 +103,20 @@ bash: /usr/bin/su: 不允许的操作  (exit 126)
 
 ## 检测覆盖范围
 
-| 场景 | 覆盖 | 说明 |
-|------|:----:|------|
-| **宿主机 SUID 提权** | ✅ | 核心用途 — 拦截被篡改的 SUID 二进制 |
-| **容器逃逸** | ❌ | 逃逸目标是 cron/systemd/shell 配置等非 SUID 文件 |
-| **跨容器攻击** | ❌ | 被污染的文件不一定是 SUID |
+fanotify Guard 基于 `FAN_OPEN_EXEC_PERM` 拦截 `execve()`，设计上仅覆盖 SUID/SGID 二进制执行。以下是与实际宿主机攻击路径的对照（PoC 见 `poc/host-attacks/`）：
 
-如需更广的覆盖范围（容器逃逸、跨容器攻击），可结合定期 `O_DIRECT` 全量扫描关键系统文件。
+| 攻击路径 | fanotify Guard | O_DIRECT 定期扫描 | 原因 |
+|---------|:--------------:|:----------------:|------|
+| SUID/SGID 二进制覆写 | ✅ | ✅ | execve 时实时拦截 |
+| `/etc/passwd` UID 篡改 | ❌ | ✅ | 配置文件，被 `open()`+`read()` 读取 |
+| PAM 模块认证绕过 | ❌ | ✅ | 共享库通过 `dlopen()` 加载 |
+| 共享库 Live-Patching | ❌ | ✅ | 通过 `mmap()` 映射，非 execve |
+| `/etc/profile` 命令注入 | ❌ | ✅ | 登录 Shell `source` 读取 |
+| Cron 脚本篡改 | ❌ | ✅ | 由 crond 通过 `execve()` 执行，但不属于 SUID 文件 |
+| `ld.so.preload` 路径劫持 | ❌ | ✅ | 动态链接器在进程启动时读取 |
+| 容器逃逸（层共享） | ❌ | ✅ | overlay lower layer 定期扫描 |
+
+Guard 解决最危急的场景——阻止被篡改的 SUID 二进制执行提权。其余 6 条宿主机路径和容器场景，通过 O_DIRECT 定期扫描覆盖。扫描优先级：PAM 模块和共享库（`/lib64/security/`、`/lib64/*.so`）> 关键配置文件（`/etc/passwd`、`/etc/profile`、`/etc/ld.so.preload`）> cron 脚本和容器 lower layer。
 
 ## PoC 脚本
 
@@ -117,6 +125,7 @@ bash: /usr/bin/su: 不允许的操作  (exit 126)
 | `poc/poc_marker.py` | 触发 Copy Fail 向文件页缓存写入 `0xDEADBEEF` 标记 |
 | `poc/verify_marker.py` | 验证标记是否可见（测试跨容器页缓存共享） |
 | `poc/shocker_copyfail.py` | Shocker + Copy Fail 组合攻击 — 通过 `CAP_DAC_READ_SEARCH` 实现容器逃逸 |
+| `poc/host-attacks/` | **7 条宿主机攻击路径 PoC**：passwd UID / PAM 绕过 / 共享库 / profile 注入 / cron 脚本 / ld.so.preload / SUID ELF（详见 [README](poc/host-attacks/README.md)） |
 
 **警告**: PoC 脚本需要未修补的内核，仅用于授权安全研究。
 

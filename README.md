@@ -12,6 +12,7 @@ Page cache corruption vulnerabilities allow attackers to modify the in-memory co
 
 | CVE | Name | Year |
 |-----|------|------|
+| CVE-2026-43284 / CVE-2026-43500 | Dirty Frag | 2026 |
 | CVE-2026-31431 | Copy Fail | 2026 |
 | CVE-2022-0847 | Dirty Pipe | 2022 |
 | CVE-2016-5195 | Dirty COW | 2016 |
@@ -118,13 +119,20 @@ bash: /usr/bin/su: Operation not permitted  (exit 126)
 
 ## Detection Scope
 
-| Scenario | Covered | Notes |
-|----------|:-------:|-------|
-| **Host SUID privilege escalation** | ✅ | Core use case — blocks tampered SUID binaries |
-| **Container escape** | ❌ | Escapes target cron/systemd/shell configs, not SUID files |
-| **Cross-container attack** | ❌ | Polluted files are not necessarily SUID |
+The fanotify Guard intercepts `execve()` via `FAN_OPEN_EXEC_PERM` — by design it only covers SUID/SGID binary execution. Here's how it maps to actual host-side attack paths (see `poc/host-attacks/` for PoCs):
 
-For broader coverage (container escape, cross-container attacks), combine with periodic `O_DIRECT` full-scan of critical system files.
+| Attack Path | fanotify Guard | O_DIRECT Periodic Scan | Why |
+|-------------|:--------------:|:----------------------:|-----|
+| SUID/SGID binary overwrite | ✅ | ✅ | Real-time interception at execve |
+| `/etc/passwd` UID tampering | ❌ | ✅ | Config file, read via `open()`+`read()` |
+| PAM module bypass | ❌ | ✅ | Shared library loaded via `dlopen()` |
+| Shared library live-patching | ❌ | ✅ | Loaded via `mmap()`, not execve |
+| `/etc/profile` command injection | ❌ | ✅ | Shell `source`, not execve |
+| Cron script tampering | ❌ | ✅ | Executed by crond, but not a SUID file |
+| `ld.so.preload` path hijacking | ❌ | ✅ | Read by dynamic linker at process startup |
+| Container escape (layer sharing) | ❌ | ✅ | Periodic scan of overlay lower layer |
+
+The Guard covers the most urgent case — blocking tampered SUID binary execution. For the remaining 6 host-side paths and container scenarios, use periodic `O_DIRECT` scanning of critical files. Scan priority: PAM modules & shared libraries (`/lib64/security/`, `/lib64/*.so`) > config files (`/etc/passwd`, `/etc/profile`, `/etc/ld.so.preload`) > cron scripts & container lower layers.
 
 ## PoC Scripts
 
@@ -133,6 +141,7 @@ For broader coverage (container escape, cross-container attacks), combine with p
 | `poc/poc_marker.py` | Trigger Copy Fail to write `0xDEADBEEF` to a file's page cache |
 | `poc/verify_marker.py` | Verify if the marker is visible (tests cross-container page cache sharing) |
 | `poc/shocker_copyfail.py` | Shocker + Copy Fail combo — escape container via `CAP_DAC_READ_SEARCH` |
+| `poc/host-attacks/` | **7 host-side exploitation PoCs**: passwd UID, PAM bypass, shared lib, profile inject, cron script, ld.so.preload, SUID ELF (see [README](poc/host-attacks/README.md)) |
 
 **Warning**: PoC scripts require a vulnerable kernel and are for authorized research only.
 
