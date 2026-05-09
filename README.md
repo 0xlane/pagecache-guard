@@ -11,6 +11,8 @@ It uses `fanotify` + `O_DIRECT` to compare page cache content against on-disk co
 - **Critical config files** — inode-level monitoring of `/etc/passwd`, `/etc/profile`, PAM modules, `ld.so.preload`
 - **Shared libraries** — periodic scanning for already-mapped libs
 
+> **Read the full research article:** [Deep Dive into Copy Fail: Root Cause, Exploitation, and Detection of a Linux Page Cache Vulnerability](https://reinject.top/en/posts/linux-security/copy-fail-cve-2026-31431/)
+
 ## Why This Exists
 
 Page cache corruption vulnerabilities allow attackers to modify the in-memory content of **read-only** files:
@@ -225,8 +227,11 @@ If a SUID binary is being updated (e.g., `yum update`), the page cache and disk 
 
 ## Related Research
 
+**Author's research article:**
+- [Deep Dive into Copy Fail: Root Cause, Exploitation, and Detection of a Linux Page Cache Vulnerability](https://reinject.top/en/posts/linux-security/copy-fail-cve-2026-31431/)
+
+**References:**
 - [Copy Fail — xint.io](https://xint.io/posts/copy-fail-cve-2026-31431/) — Original vulnerability disclosure and technical writeup
-- [Copy Fail — reinject.top](https://reinject.top/en/posts/linux-security/copy-fail-cve-2026-31431/) — In-depth research article
 - [CVE-2026-31431 on NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-31431)
 - [Kernel fix commit](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=a664bf3d603d)
 
