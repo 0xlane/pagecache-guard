@@ -25,8 +25,14 @@ def discover_pam_modules(pam_dir):
     return sorted(modules)
 
 
-def setup_inode_marks(fan_fd, watch_files, watch_pam_dir=None):
+def setup_inode_marks(fan_fd, watch_files, watch_pam_dir=None,
+                      flush_fn=None):
     """Set up FAN_OPEN_PERM inode marks on critical files.
+
+    *flush_fn*, if provided, is called after every batch of marks to
+    drain pending permission events.  This prevents other processes
+    (sshd, crond, etc.) from blocking on already-marked files while
+    the main event loop has not started yet.
 
     Returns a set of successfully marked paths.
     """
@@ -40,10 +46,27 @@ def setup_inode_marks(fan_fd, watch_files, watch_pam_dir=None):
             logger.info("Auto-discovered %d PAM modules in %s",
                         len(pam_modules), watch_pam_dir)
 
+    batch = 0
+    marked_inodes = set()
     for path in targets:
         if not os.path.exists(path):
             logger.warning("Watch file does not exist, skipping: %s", path)
             continue
+
+        try:
+            ino = os.stat(path).st_ino
+        except OSError as exc:
+            logger.warning("Cannot stat for inode mark: %s (%s)", path, exc)
+            continue
+
+        if ino in marked_inodes:
+            logger.debug("  Skipping hardlink (inode %d already marked): %s",
+                         ino, path)
+            marked.add(os.path.realpath(path))
+            continue
+
+        if flush_fn:
+            flush_fn()
 
         try:
             fd = os.open(path, os.O_RDONLY)
@@ -57,8 +80,16 @@ def setup_inode_marks(fan_fd, watch_files, watch_pam_dir=None):
 
         if ret == 0:
             marked.add(os.path.realpath(path))
+            marked_inodes.add(ino)
             logger.info("  Inode mark (FAN_OPEN_PERM): %s", path)
+            batch += 1
         else:
             logger.warning("fanotify_mark inode failed for %s", path)
+
+        if flush_fn and batch % 5 == 0:
+            flush_fn()
+
+    if flush_fn:
+        flush_fn()
 
     return marked

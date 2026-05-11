@@ -154,7 +154,8 @@ def main():
     # ---- Inode marks (Phase 1b) ----
     if args.watch_file or args.watch_pam:
         marked = setup_inode_marks(handler.fan_fd,
-                                   args.watch_file, args.watch_pam)
+                                   args.watch_file, args.watch_pam,
+                                   flush_fn=handler.flush_pending)
         watched_files_set.update(marked)
         logger.info("Inode marks set for %d files", len(marked))
 

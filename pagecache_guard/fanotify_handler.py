@@ -15,7 +15,8 @@ import logging
 
 from .config import (
     libc, FAN_CLASS_CONTENT, FAN_CLOEXEC, FAN_OPEN_EXEC_PERM,
-    FAN_OPEN_PERM, FAN_MARK_ADD, FAN_MARK_MOUNT, AT_FDCWD,
+    FAN_OPEN_PERM, FAN_MARK_ADD, FAN_MARK_REMOVE, FAN_MARK_MOUNT,
+    FAN_MARK_IGNORED_MASK, AT_FDCWD,
     FAN_ALLOW, FAN_DENY, O_RDONLY, O_LARGEFILE,
     EVENT_FMT, EVENT_SIZE,
 )
@@ -61,6 +62,7 @@ class FanotifyHandler:
         self.check_root = check_root
         self.use_exec_perm = True
         self.fan_fd = -1
+        self._guard_pid = os.getpid()
         self.stats = {
             "checked": 0, "blocked": 0, "skipped_root": 0,
             "skipped_non_target": 0, "errors": 0,
@@ -167,6 +169,13 @@ class FanotifyHandler:
     # ------------------------------------------------------------------
 
     def _handle_event(self, mask, efd, pid):
+        # Kernel 4.18 (RHEL 8) does not exempt the fanotify reader thread
+        # from FAN_OPEN_PERM events on inode marks.  When check_integrity()
+        # opens an inode-marked file via O_DIRECT, it would trigger a self-
+        # event and deadlock.  Skip events from our own process.
+        if pid == self._guard_pid:
+            return FAN_ALLOW
+
         is_exec = (bool(mask & FAN_OPEN_EXEC_PERM) if self.use_exec_perm
                    else bool(mask & FAN_OPEN_PERM))
 
@@ -211,6 +220,18 @@ class FanotifyHandler:
                 return FAN_ALLOW
 
         # Integrity comparison
+        #
+        # For inode-marked files, O_DIRECT read would re-open the file and
+        # trigger another FAN_OPEN_PERM that we can't respond to (single-
+        # threaded event loop), causing a deadlock that blocks ALL file
+        # opens on the mount.  Temporarily suppress events on this inode
+        # via FAN_MARK_IGNORED_MASK before opening with O_DIRECT.
+        suppress_inode = (check_reason == "inode_watch")
+        if suppress_inode:
+            libc.fanotify_mark(self.fan_fd,
+                               FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
+                               FAN_OPEN_PERM, efd, None)
+
         self.stats["checked"] += 1
         try:
             intact, diff_off = check_integrity(path, efd, logger)
@@ -218,6 +239,11 @@ class FanotifyHandler:
             logger.warning("Check error pid=%d %s: %s", pid, path, exc)
             self.stats["errors"] += 1
             return FAN_ALLOW
+        finally:
+            if suppress_inode:
+                libc.fanotify_mark(self.fan_fd,
+                                   FAN_MARK_REMOVE | FAN_MARK_IGNORED_MASK,
+                                   FAN_OPEN_PERM, efd, None)
 
         if not intact:
             self.stats["blocked"] += 1
@@ -230,6 +256,42 @@ class FanotifyHandler:
             if not self.dry_run:
                 return FAN_DENY
         return FAN_ALLOW
+
+    # ------------------------------------------------------------------
+    # Drain pending events (used during setup phase)
+    # ------------------------------------------------------------------
+
+    def flush_pending(self):
+        """Read and auto-allow all pending permission events.
+
+        Must be called periodically during inode-mark setup to prevent
+        other processes from blocking on FAN_OPEN_PERM events while the
+        event loop is not yet running.
+        """
+        import select
+        while True:
+            ready, _, _ = select.select([self.fan_fd], [], [], 0)
+            if not ready:
+                break
+            try:
+                buf = os.read(self.fan_fd, EVENT_SIZE * 32)
+            except OSError:
+                break
+            off = 0
+            while off + EVENT_SIZE <= len(buf):
+                evlen, _v, _r, _m, _mask, efd, _pid = \
+                    struct.unpack_from(EVENT_FMT, buf, off)
+                off += evlen
+                if efd >= 0:
+                    resp = struct.pack("iI", efd, FAN_ALLOW)
+                    try:
+                        os.write(self.fan_fd, resp)
+                    except OSError:
+                        pass
+                    try:
+                        os.close(efd)
+                    except OSError:
+                        pass
 
     # ------------------------------------------------------------------
     # Cleanup
