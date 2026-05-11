@@ -214,10 +214,10 @@ def main():
     logger.info(
         "Shutting down. Stats: checked=%d blocked=%d "
         "skipped_root=%d skipped_non_target=%d "
-        "daemon_checks=%d inode_checks=%d errors=%d",
+        "daemon_checks=%d inode_checks=%d inode_cache_hits=%d errors=%d",
         s["checked"], s["blocked"], s["skipped_root"],
         s["skipped_non_target"], s["daemon_checks"],
-        s["inode_checks"], s["errors"])
+        s["inode_checks"], s.get("inode_cache_hits", 0), s["errors"])
     if scanner.watch_libs:
         logger.info("Periodic scanner: scans=%d alerts=%d",
                      scanner.stats["scans"], scanner.stats["alerts"])

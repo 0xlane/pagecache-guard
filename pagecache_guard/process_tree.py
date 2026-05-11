@@ -46,6 +46,12 @@ def find_watched_ancestor(pid, watched_daemons=None, max_depth=None):
 
     Returns the daemon comm name if a watched ancestor is found within
     *max_depth* levels, or empty string otherwise.
+
+    PID 1 (systemd/init) is only matched when it is the *immediate*
+    parent of the executing process.  Without this restriction, every
+    process on the system would match ``systemd`` as a watched daemon,
+    causing a full O_DIRECT check on every single exec event and making
+    the system unresponsive.
     """
     if watched_daemons is None:
         watched_daemons = DEFAULT_WATCHED_DAEMONS
@@ -57,10 +63,14 @@ def find_watched_ancestor(pid, watched_daemons=None, max_depth=None):
         ppid = get_ppid(current)
         if ppid <= 0:
             break
+        if ppid == 1:
+            if current == pid:
+                comm = get_comm(ppid)
+                if comm in watched_daemons:
+                    return comm
+            break
         comm = get_comm(ppid)
         if comm in watched_daemons:
             return comm
-        if ppid == 1:
-            break
         current = ppid
     return ""

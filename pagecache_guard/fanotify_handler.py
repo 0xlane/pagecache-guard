@@ -11,6 +11,7 @@ import os
 import stat
 import struct
 import ctypes
+import time
 import logging
 
 from .config import (
@@ -63,10 +64,13 @@ class FanotifyHandler:
         self.use_exec_perm = True
         self.fan_fd = -1
         self._guard_pid = os.getpid()
+        self._inode_check_cache = {}
+        self._inode_cache_ttl = max(cache_ttl, 2.0)
         self.stats = {
             "checked": 0, "blocked": 0, "skipped_root": 0,
             "skipped_non_target": 0, "errors": 0,
             "daemon_checks": 0, "inode_checks": 0,
+            "inode_cache_hits": 0,
         }
 
     # ------------------------------------------------------------------
@@ -205,6 +209,11 @@ class FanotifyHandler:
 
         # Rule 3: inode-marked critical file opened
         if check_reason is None and is_watched:
+            now = time.monotonic()
+            last = self._inode_check_cache.get(path)
+            if last is not None and (now - last) < self._inode_cache_ttl:
+                self.stats["inode_cache_hits"] += 1
+                return FAN_ALLOW
             check_reason = "inode_watch"
             self.stats["inode_checks"] += 1
 
@@ -247,6 +256,7 @@ class FanotifyHandler:
 
         if not intact:
             self.stats["blocked"] += 1
+            self._inode_check_cache.pop(path, None)
             uid = get_exec_uid(pid)
             action = "BLOCKED" if not self.dry_run else "DETECTED"
             logger.warning(
@@ -255,6 +265,8 @@ class FanotifyHandler:
                 action, pid, uid, path, check_reason, diff_off)
             if not self.dry_run:
                 return FAN_DENY
+        elif check_reason == "inode_watch":
+            self._inode_check_cache[path] = time.monotonic()
         return FAN_ALLOW
 
     # ------------------------------------------------------------------
