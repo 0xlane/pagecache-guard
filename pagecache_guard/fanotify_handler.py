@@ -17,7 +17,7 @@ import logging
 from .config import (
     libc, FAN_CLASS_CONTENT, FAN_CLOEXEC, FAN_OPEN_EXEC_PERM,
     FAN_OPEN_PERM, FAN_MARK_ADD, FAN_MARK_REMOVE, FAN_MARK_MOUNT,
-    FAN_MARK_IGNORED_MASK, AT_FDCWD,
+    FAN_MARK_IGNORED_MASK, FAN_MARK_FILESYSTEM, AT_FDCWD,
     FAN_ALLOW, FAN_DENY, O_RDONLY, O_LARGEFILE,
     EVENT_FMT, EVENT_SIZE,
 )
@@ -78,7 +78,12 @@ class FanotifyHandler:
     # ------------------------------------------------------------------
 
     def init_fanotify(self):
-        """Create the fanotify fd and add mount marks.  Returns True on success."""
+        """Create the fanotify fd and add filesystem/mount marks.
+
+        Tries FAN_MARK_FILESYSTEM first (works across mount namespaces,
+        required when running inside systemd with ProtectHome= etc.).
+        Falls back to FAN_MARK_MOUNT if the kernel doesn't support it.
+        """
         self.fan_fd = libc.fanotify_init(
             FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE)
         if self.fan_fd < 0:
@@ -96,23 +101,40 @@ class FanotifyHandler:
             if dev in marked_devs:
                 continue
 
-            ret = libc.fanotify_mark(
-                self.fan_fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                FAN_OPEN_EXEC_PERM, AT_FDCWD, mp.encode())
-            if ret == 0:
-                marked_devs.add(dev)
-                logger.info("Monitoring mount (FAN_OPEN_EXEC_PERM): %s", mp)
+            marked = False
+            for mark_flag, mark_label in [
+                (FAN_MARK_FILESYSTEM, "filesystem"),
+                (FAN_MARK_MOUNT, "mount"),
+            ]:
+                ret = libc.fanotify_mark(
+                    self.fan_fd, FAN_MARK_ADD | mark_flag,
+                    FAN_OPEN_EXEC_PERM, AT_FDCWD, mp.encode())
+                if ret == 0:
+                    marked_devs.add(dev)
+                    logger.info("Monitoring %s (FAN_OPEN_EXEC_PERM): %s",
+                                mark_label, mp)
+                    marked = True
+                    break
+
+            if marked:
                 continue
 
             self.use_exec_perm = False
-            ret = libc.fanotify_mark(
-                self.fan_fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                FAN_OPEN_PERM, AT_FDCWD, mp.encode())
-            if ret == 0:
-                marked_devs.add(dev)
-                logger.info("Monitoring mount (FAN_OPEN_PERM fallback): %s",
-                            mp)
-            else:
+            for mark_flag, mark_label in [
+                (FAN_MARK_FILESYSTEM, "filesystem"),
+                (FAN_MARK_MOUNT, "mount"),
+            ]:
+                ret = libc.fanotify_mark(
+                    self.fan_fd, FAN_MARK_ADD | mark_flag,
+                    FAN_OPEN_PERM, AT_FDCWD, mp.encode())
+                if ret == 0:
+                    marked_devs.add(dev)
+                    logger.info("Monitoring %s (FAN_OPEN_PERM fallback): %s",
+                                mark_label, mp)
+                    marked = True
+                    break
+
+            if not marked:
                 logger.error("fanotify_mark failed for %s (errno=%d)",
                              mp, ctypes.get_errno())
 

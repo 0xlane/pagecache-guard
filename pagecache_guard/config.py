@@ -15,6 +15,7 @@ FAN_MARK_ADD          = 0x01
 FAN_MARK_REMOVE       = 0x02
 FAN_MARK_MOUNT        = 0x10
 FAN_MARK_IGNORED_MASK = 0x20
+FAN_MARK_FILESYSTEM   = 0x100
 AT_FDCWD             = -100
 FAN_ALLOW            = 0x01
 FAN_DENY             = 0x02

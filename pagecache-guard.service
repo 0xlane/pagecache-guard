@@ -23,7 +23,8 @@ SyslogIdentifier=pagecache-guard
 LogsDirectory=pagecache-guard
 
 # Hardening
-ProtectHome=true
+# NOTE: ProtectHome/ProtectSystem create mount namespaces which break
+# FAN_MARK_MOUNT — only use them if the kernel supports FAN_MARK_FILESYSTEM.
 NoNewPrivileges=false
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
