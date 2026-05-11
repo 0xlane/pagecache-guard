@@ -28,9 +28,28 @@ Traditional security tools (file integrity monitors, image scanners, fs-verity) 
 
 ## How It Works
 
+### Setup Phase
+
+```
+1. Scan directories for SUID/SGID binaries
+2. fanotify_init(FAN_CLASS_CONTENT)
+3. Mount mark: FAN_OPEN_EXEC_PERM on each target mount
+4. Inode marks: FAN_OPEN_PERM on critical files + PAM modules
+   - Hardlink dedup: skip inodes already marked (prevents self-deadlock)
+   - Flush pending events between marks (prevents system-wide blocking)
+5. Start periodic scanner thread for mapped shared libraries
+6. Enter event loop
+```
+
+### Event Loop
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                  pagecache_guard (v0.2)                       │
+│                                                              │
+│  Self-PID guard ─────────────────────────────────────────── │
+│  Skip events from our own process (prevents deadlock        │
+│  when O_DIRECT re-opens an inode-marked file)               │
 │                                                              │
 │  FAN_OPEN_EXEC_PERM (mount mark) ──────────────────────────  │
 │  On execve():                                                │
@@ -41,7 +60,8 @@ Traditional security tools (file integrity monitors, image scanners, fs-verity) 
 │  FAN_OPEN_PERM (inode marks) ──────────────────────────────  │
 │  On open() of marked files:                                  │
 │    /etc/passwd, /etc/profile, PAM modules, ld.so.preload     │
-│    → O_DIRECT check (block/allow)                            │
+│    → Suppress mark → O_DIRECT check → Restore mark           │
+│      (FAN_MARK_IGNORED_MASK prevents self-event deadlock)    │
 │                                                              │
 │  Periodic O_DIRECT scan (background thread) ───────────────  │
 │  Already-mapped shared libraries (libnss, libpam, etc.)      │
@@ -52,17 +72,22 @@ Traditional security tools (file integrity monitors, image scanners, fs-verity) 
 ```mermaid
 flowchart TD
     A[Start Guard] --> B[Scan SUID/SGID files]
-    B --> C[Set up fanotify\nmount marks + inode marks]
-    C --> D{Event received}
+    B --> C[Mount mark:\nFAN_OPEN_EXEC_PERM]
+    C --> C2[Inode marks:\nFAN_OPEN_PERM\n+ hardlink dedup\n+ flush pending]
+    C2 --> C3[Start periodic\nscanner thread]
+    C3 --> D{Event received}
 
-    D --> E{SUID/SGID\nbinary?}
+    D --> S{Self-PID?}
+    S -- Yes --> Q
+    S -- No --> E{SUID/SGID\nbinary?}
     E -- Yes --> G{UID = 0?}
     E -- No --> F{Parent is\nwatched daemon?}
 
     F -- Yes --> I
     F -- No --> P{Inode-marked\nfile?}
 
-    P -- Yes --> I
+    P -- Yes --> IM[Suppress inode mark\nFAN_MARK_IGNORED_MASK]
+    IM --> I
     P -- No --> Q[FAN_ALLOW\nSkip]
 
     G -- Yes --> H[Skip check]
@@ -150,9 +175,10 @@ pagecache-guard/
 │   ├── core.py                   # O_DIRECT read, integrity check, checksum cache
 │   ├── fanotify_handler.py       # fanotify setup, mount marks, event loop
 │   ├── process_tree.py           # /proc traversal for daemon-child detection
-│   ├── inode_watcher.py          # FAN_OPEN_PERM inode marks for critical files
+│   ├── inode_watcher.py          # FAN_OPEN_PERM inode marks (hardlink-aware)
 │   └── periodic_scanner.py       # Background thread for mapped-lib scanning
 ├── pagecache_guard.py            # Backward-compatible single-file entry point
+├── test_guard.sh                 # 13-test end-to-end validation suite
 ├── poc/                          # Exploitation PoCs
 │   ├── host-attacks/             # 7 host-side attack path PoCs
 │   ├── poc_marker.py

@@ -28,9 +28,28 @@
 
 ## 工作原理
 
+### 初始化阶段
+
+```
+1. 扫描目录中的 SUID/SGID 二进制
+2. fanotify_init(FAN_CLASS_CONTENT)
+3. 挂载点标记: FAN_OPEN_EXEC_PERM
+4. Inode 标记: FAN_OPEN_PERM (关键文件 + PAM 模块)
+   - 硬链接去重: 跳过已标记的 inode（防止自死锁）
+   - 标记间隙刷新待处理事件（防止系统级阻塞）
+5. 启动周期扫描器后台线程
+6. 进入事件循环
+```
+
+### 事件循环
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                  pagecache_guard (v0.2)                       │
+│                                                              │
+│  自身 PID 过滤 ─────────────────────────────────────────── │
+│  跳过来自自身进程的事件（防止 O_DIRECT 重新打开              │
+│  inode 标记文件时的自死锁）                                  │
 │                                                              │
 │  FAN_OPEN_EXEC_PERM（挂载点标记）────────────────────────── │
 │  execve 事件:                                                │
@@ -41,7 +60,8 @@
 │  FAN_OPEN_PERM（inode 标记）─────────────────────────────── │
 │  标记文件被 open() 时:                                       │
 │    /etc/passwd, /etc/profile, PAM 模块, ld.so.preload        │
-│    → O_DIRECT 检查（拦截/放行）                              │
+│    → 临时抑制标记 → O_DIRECT 检查 → 恢复标记                │
+│     （FAN_MARK_IGNORED_MASK 防止自事件死锁）                 │
 │                                                              │
 │  周期性 O_DIRECT 扫描（后台线程）────────────────────────── │
 │  已映射的共享库（libnss、libpam 等）                         │
@@ -52,17 +72,22 @@
 ```mermaid
 flowchart TD
     A[启动 Guard] --> B[扫描 SUID/SGID 文件]
-    B --> C[设置 fanotify\n挂载点标记 + inode 标记]
-    C --> D{收到事件}
+    B --> C[挂载点标记:\nFAN_OPEN_EXEC_PERM]
+    C --> C2[Inode 标记:\nFAN_OPEN_PERM\n+ 硬链接去重\n+ 刷新待处理事件]
+    C2 --> C3[启动周期\n扫描器线程]
+    C3 --> D{收到事件}
 
-    D --> E{SUID/SGID\n二进制?}
+    D --> S{自身 PID?}
+    S -- 是 --> Q
+    S -- 否 --> E{SUID/SGID\n二进制?}
     E -- 是 --> G{UID = 0?}
     E -- 否 --> F{父进程是\n监控的守护进程?}
 
     F -- 是 --> I
     F -- 否 --> P{被 inode\n标记的文件?}
 
-    P -- 是 --> I
+    P -- 是 --> IM[临时抑制 inode 标记\nFAN_MARK_IGNORED_MASK]
+    IM --> I
     P -- 否 --> Q[FAN_ALLOW\n跳过]
 
     G -- 是 --> H[跳过检查]
@@ -150,9 +175,10 @@ pagecache-guard/
 │   ├── core.py                   # O_DIRECT 读取、完整性校验、校验和缓存
 │   ├── fanotify_handler.py       # fanotify 设置、挂载点标记、事件循环
 │   ├── process_tree.py           # /proc 进程树遍历（守护进程子进程检测）
-│   ├── inode_watcher.py          # FAN_OPEN_PERM inode 标记管理
+│   ├── inode_watcher.py          # FAN_OPEN_PERM inode 标记（硬链接感知）
 │   └── periodic_scanner.py       # 后台线程周期扫描已映射共享库
 ├── pagecache_guard.py            # 向后兼容的单文件入口
+├── test_guard.sh                 # 13 项端到端验证测试套件
 ├── poc/                          # 漏洞利用 PoC
 │   ├── host-attacks/             # 7 条宿主机攻击路径 PoC
 │   ├── poc_marker.py
