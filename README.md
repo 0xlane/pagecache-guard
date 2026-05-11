@@ -133,6 +133,28 @@ sudo python3 -m pagecache_guard --syslog --log-file /var/log/pagecache_guard.log
 sudo python3 -m pagecache_guard --check-root /usr
 ```
 
+## Deploy as Systemd Service
+
+```bash
+# Install
+sudo mkdir -p /opt/pagecache-guard
+sudo cp -r pagecache_guard/ pagecache_guard.py poc/ /opt/pagecache-guard/
+sudo cp pagecache-guard.service /etc/systemd/system/
+
+# Edit ExecStart in the service file to match your environment
+sudo systemctl edit pagecache-guard.service  # override paths/options as needed
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now pagecache-guard
+
+# Check status and logs
+sudo systemctl status pagecache-guard
+sudo journalctl -u pagecache-guard -f
+```
+
+The service unit (`pagecache-guard.service`) includes systemd hardening options and auto-restart on failure.
+
 ## Example Output
 
 ```
@@ -179,6 +201,7 @@ pagecache-guard/
 │   └── periodic_scanner.py       # Background thread for mapped-lib scanning
 ├── pagecache_guard.py            # Backward-compatible single-file entry point
 ├── test_guard.sh                 # 13-test end-to-end validation suite
+├── pagecache-guard.service       # Systemd service unit file
 ├── poc/                          # Exploitation PoCs
 │   ├── host-attacks/             # 7 host-side attack path PoCs
 │   ├── poc_marker.py

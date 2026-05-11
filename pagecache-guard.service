@@ -1,0 +1,32 @@
+[Unit]
+Description=Page Cache Integrity Guard (fanotify + O_DIRECT)
+Documentation=https://github.com/0xlane/pagecache-guard
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m pagecache_guard \
+    --check-root \
+    --watch-daemon crond,anacron,atd,systemd \
+    --watch-file /etc/passwd /etc/profile /etc/ld.so.preload \
+    --watch-pam /lib64/security \
+    --watch-lib /lib64/libnss_files.so.2 /lib64/libpam.so.0 \
+    --syslog \
+    -- /usr /bin /sbin
+WorkingDirectory=/opt/pagecache-guard
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pagecache-guard
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+NoNewPrivileges=false
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

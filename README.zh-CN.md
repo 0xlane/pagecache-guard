@@ -133,6 +133,28 @@ sudo python3 -m pagecache_guard --syslog --log-file /var/log/pagecache_guard.log
 sudo python3 -m pagecache_guard --check-root /usr
 ```
 
+## 部署为 Systemd 服务
+
+```bash
+# 安装
+sudo mkdir -p /opt/pagecache-guard
+sudo cp -r pagecache_guard/ pagecache_guard.py poc/ /opt/pagecache-guard/
+sudo cp pagecache-guard.service /etc/systemd/system/
+
+# 根据环境编辑 ExecStart 中的路径和参数
+sudo systemctl edit pagecache-guard.service
+
+# 启用并启动
+sudo systemctl daemon-reload
+sudo systemctl enable --now pagecache-guard
+
+# 查看状态和日志
+sudo systemctl status pagecache-guard
+sudo journalctl -u pagecache-guard -f
+```
+
+服务单元文件（`pagecache-guard.service`）包含 systemd 安全加固选项，失败时自动重启。
+
 ## 运行效果
 
 ```
@@ -179,6 +201,7 @@ pagecache-guard/
 │   └── periodic_scanner.py       # 后台线程周期扫描已映射共享库
 ├── pagecache_guard.py            # 向后兼容的单文件入口
 ├── test_guard.sh                 # 13 项端到端验证测试套件
+├── pagecache-guard.service       # Systemd 服务单元文件
 ├── poc/                          # 漏洞利用 PoC
 │   ├── host-attacks/             # 7 条宿主机攻击路径 PoC
 │   ├── poc_marker.py
