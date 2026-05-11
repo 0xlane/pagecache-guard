@@ -21,13 +21,16 @@ fail() { echo -e "${RED}[FAIL]${NC} $1"; FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); }
 
 cleanup() {
     log "Cleaning up..."
-    # kill any lingering guard processes
     pkill -f "pagecache_guard" 2>/dev/null || true
     sleep 0.5
-    # drop caches to clear test artifacts from page cache
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    # remove test user
     userdel testpcg 2>/dev/null || true
+    # Restore crontab if test was interrupted
+    crontab -l 2>/dev/null | grep -v "pcg-test\|cron_binary" | crontab - 2>/dev/null || true
+    # Remove test systemd service
+    systemctl stop pcg-test.service 2>/dev/null || true
+    rm -f /etc/systemd/system/pcg-test.service
+    systemctl daemon-reload 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
@@ -308,52 +311,201 @@ else
 fi
 
 # ========================================================================
-# TEST 9: Phase 1a — daemon-exec detection (simulated)
+# TEST 9: Phase 1a — daemon-exec detection (end-to-end via crond)
 # ========================================================================
-log "TEST 9: Daemon-exec process tree detection"
+log "TEST 9: Daemon-exec detection via crond (end-to-end, ~65s)"
 echo 3 > /proc/sys/vm/drop_caches
 sleep 0.5
 
-# Create a SUID wrapper that will be executed by crond
-# (For this test, we'll check the daemon detection by creating a script
-# and verifying guard recognizes daemon parents)
+# Build a NON-SUID binary for crond to execute
+gcc -o "$TEST_DIR/cron_binary" "$TEST_DIR/suid_test.c"
+chmod 755 "$TEST_DIR/cron_binary"  # explicitly NOT suid
+sync
+
+# Start guard — monitor $TEST_DIR mount (SUID scan is dir-scoped,
+# but fanotify FAN_MARK_MOUNT covers the whole mount including crond execs)
 python3 -m pagecache_guard --dry-run --check-root \
-    --watch-daemon crond,systemd "$TEST_DIR" \
+    --watch-daemon crond -- "$TEST_DIR" \
     > "$TEST_DIR/test9.log" 2>&1 &
 GUARD_PID=$!
-sleep 2
+sleep 3
 
-kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
-
-if grep -q "Watching daemon parents" "$TEST_DIR/test9.log"; then
-    pass "TEST 9: Daemon-exec feature initialized (crond,systemd)"
-else
+if ! grep -q "Watching daemon parents" "$TEST_DIR/test9.log"; then
+    kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
     echo "  Guard log:"
     cat "$TEST_DIR/test9.log"
     fail "TEST 9: Daemon-exec feature not initialized"
+else
+    # Corrupt binary and pin pages via mmap
+    python3 -u - "$TEST_DIR/cron_binary" << 'PYEOF' > "$TEST_DIR/poc_test9.log" 2>&1 &
+import os, sys, mmap, time, signal
+sys.path.insert(0, ".")
+from poc.poc_marker import page_cache_write_4bytes
+
+target = sys.argv[1]
+fd = os.open(target, os.O_RDONLY)
+page_cache_write_4bytes(fd, 0, b'\xDE\xAD\xBE\xEF')
+mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+print(f"Corruption pinned: {mm[:4].hex()}", flush=True)
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+time.sleep(120)
+PYEOF
+    PINNER_PID=$!
+    sleep 1
+
+    # Install cron job (every minute)
+    SAVED_CRONTAB=$(crontab -l 2>/dev/null || true)
+    echo "* * * * * $TEST_DIR/cron_binary >> $TEST_DIR/cron_output.log 2>&1" | crontab -
+
+    # Wait for crond to execute (max 70s)
+    log "  Waiting for crond to execute binary..."
+    DETECTED=false
+    for i in $(seq 1 70); do
+        if grep -q "DETECTED.*cron_binary" "$TEST_DIR/test9.log" 2>/dev/null; then
+            DETECTED=true
+            break
+        fi
+        sleep 1
+    done
+
+    # Restore crontab
+    if [ -n "$SAVED_CRONTAB" ]; then
+        echo "$SAVED_CRONTAB" | crontab -
+    else
+        crontab -r 2>/dev/null || true
+    fi
+    kill $PINNER_PID 2>/dev/null; wait $PINNER_PID 2>/dev/null || true
+    kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
+
+    if $DETECTED; then
+        if grep -q "reason=daemon:crond" "$TEST_DIR/test9.log"; then
+            pass "TEST 9: Daemon-exec detected tampered cron binary (reason=daemon:crond)"
+        else
+            pass "TEST 9: Daemon-exec detected tampered cron binary"
+        fi
+    else
+        echo "  Guard log (last 10 lines):"
+        tail -10 "$TEST_DIR/test9.log"
+        echo "  PoC log:"
+        cat "$TEST_DIR/poc_test9.log"
+        fail "TEST 9: crond executed but guard did not detect tampering"
+    fi
 fi
 
 # ========================================================================
-# TEST 10: PAM auto-discovery
+# TEST 10: PAM inode-watch detection (end-to-end)
 # ========================================================================
-log "TEST 10: PAM module auto-discovery"
+log "TEST 10: PAM module tampering via inode-watch (end-to-end)"
 echo 3 > /proc/sys/vm/drop_caches
 sleep 0.5
 
+# Copy a real PAM module to the test dir to avoid corrupting system files
+cp /lib64/security/pam_permit.so "$TEST_DIR/pam_test.so"
+sync
+
 python3 -m pagecache_guard --dry-run --check-root \
-    --watch-pam /lib64/security "$TEST_DIR" \
+    --watch-file "$TEST_DIR/pam_test.so" -- "$TEST_DIR" \
     > "$TEST_DIR/test10.log" 2>&1 &
 GUARD_PID=$!
 sleep 2
 
-kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
-
-if grep -q "Auto-discovered.*PAM modules" "$TEST_DIR/test10.log"; then
-    pass "TEST 10: PAM modules auto-discovered"
-else
+if ! grep -q "Inode mark" "$TEST_DIR/test10.log"; then
+    kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
     echo "  Guard log:"
     cat "$TEST_DIR/test10.log"
-    fail "TEST 10: PAM auto-discovery failed"
+    fail "TEST 10: Inode mark not set for PAM test module"
+else
+    # Corrupt the PAM module's page cache
+    python3 poc/poc_marker.py "$TEST_DIR/pam_test.so" > "$TEST_DIR/poc_test10.log" 2>&1
+
+    # Trigger open on the PAM module (simulates sshd/login opening it)
+    cat "$TEST_DIR/pam_test.so" > /dev/null 2>&1
+    sleep 1
+
+    kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
+
+    if grep -q "DETECTED.*pam_test.so.*reason=inode_watch" "$TEST_DIR/test10.log"; then
+        pass "TEST 10: PAM module tampering detected via inode-watch"
+    elif grep -q "DETECTED.*pam_test.so" "$TEST_DIR/test10.log"; then
+        pass "TEST 10: PAM module tampering detected"
+    else
+        echo "  Guard log:"
+        cat "$TEST_DIR/test10.log"
+        echo "  PoC log:"
+        cat "$TEST_DIR/poc_test10.log"
+        fail "TEST 10: PAM module tampering not detected"
+    fi
+fi
+
+# ========================================================================
+# TEST 13: Service-executed privilege escalation detection
+# ========================================================================
+log "TEST 13: Service binary tampering privilege escalation (systemd)"
+echo 3 > /proc/sys/vm/drop_caches
+sleep 0.5
+
+# Create a binary simulating a service helper
+gcc -o "$TEST_DIR/service_helper" "$TEST_DIR/suid_test.c"
+chmod 755 "$TEST_DIR/service_helper"
+
+# Create a oneshot systemd service that runs our binary
+cat > /etc/systemd/system/pcg-test.service <<SVCEOF
+[Unit]
+Description=pagecache-guard test service
+
+[Service]
+Type=oneshot
+ExecStart=$TEST_DIR/service_helper
+RemainAfterExit=no
+SVCEOF
+systemctl daemon-reload
+
+# Start guard — $TEST_DIR scoped SUID scan, mount-level fanotify catches systemd execs
+python3 -m pagecache_guard --dry-run --check-root \
+    --watch-daemon systemd -- "$TEST_DIR" \
+    > "$TEST_DIR/test13.log" 2>&1 &
+GUARD_PID=$!
+sleep 3
+
+# Corrupt service binary and pin pages
+python3 -u - "$TEST_DIR/service_helper" << 'PYEOF' > "$TEST_DIR/poc_test13.log" 2>&1 &
+import os, sys, mmap, time, signal
+sys.path.insert(0, ".")
+from poc.poc_marker import page_cache_write_4bytes
+
+target = sys.argv[1]
+fd = os.open(target, os.O_RDONLY)
+page_cache_write_4bytes(fd, 0, b'\xDE\xAD\xBE\xEF')
+mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+print(f"Corruption pinned: {mm[:4].hex()}", flush=True)
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+time.sleep(30)
+PYEOF
+PINNER_PID=$!
+sleep 1
+
+# Trigger systemd to execute the corrupted binary
+systemctl start pcg-test.service 2>/dev/null || true
+sleep 2
+
+kill $PINNER_PID 2>/dev/null; wait $PINNER_PID 2>/dev/null || true
+kill $GUARD_PID 2>/dev/null; wait $GUARD_PID 2>/dev/null || true
+
+# Clean up systemd service
+systemctl stop pcg-test.service 2>/dev/null || true
+rm -f /etc/systemd/system/pcg-test.service
+systemctl daemon-reload 2>/dev/null || true
+
+if grep -q "DETECTED.*service_helper.*reason=daemon:systemd" "$TEST_DIR/test13.log"; then
+    pass "TEST 13: Systemd service binary tampering detected (reason=daemon:systemd)"
+elif grep -q "DETECTED.*service_helper" "$TEST_DIR/test13.log"; then
+    pass "TEST 13: Systemd service binary tampering detected"
+else
+    echo "  Guard log (last 10 lines):"
+    tail -10 "$TEST_DIR/test13.log"
+    echo "  PoC log:"
+    cat "$TEST_DIR/poc_test13.log"
+    fail "TEST 13: Systemd service binary tampering not detected"
 fi
 
 # ========================================================================
