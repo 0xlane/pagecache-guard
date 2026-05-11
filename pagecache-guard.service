@@ -5,6 +5,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/pagecache-guard
 ExecStart=/usr/bin/python3 -m pagecache_guard \
     --check-root \
     --watch-daemon crond,anacron,atd,systemd \
@@ -12,6 +13,7 @@ ExecStart=/usr/bin/python3 -m pagecache_guard \
     --watch-pam /lib64/security \
     --watch-lib /lib64/libnss_files.so.2 /lib64/libpam.so.0 \
     --syslog \
+    --log-file /var/log/pagecache-guard/guard.log \
     -- /usr /bin /sbin
 WorkingDirectory=/opt/pagecache-guard
 Restart=on-failure

@@ -39,7 +39,7 @@ def main():
         help="Send alerts to syslog")
     parser.add_argument(
         "--log-file", type=str, default=None, metavar="PATH",
-        help="Write log to file")
+        help="Write log to file (rotated at 10 MB, keeps 5 backups)")
     parser.add_argument(
         "--check-root", action="store_true",
         help="Also check executions by root (default: skip)")
@@ -95,7 +95,8 @@ def main():
         logger.addHandler(syslog_h)
 
     if args.log_file:
-        file_h = logging.FileHandler(args.log_file)
+        file_h = logging.handlers.RotatingFileHandler(
+            args.log_file, maxBytes=10 * 1024 * 1024, backupCount=5)
         file_h.setFormatter(fmt)
         logger.addHandler(file_h)
 
